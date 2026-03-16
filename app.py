@@ -482,8 +482,8 @@ def stream():
         status, data_raw = mail.uid("SEARCH", None, "UNSEEN")
         uids = data_raw[0].split() if status == "OK" and data_raw[0] else []
 
-        # Reverse so newest (highest UID) is processed first
-        uids = list(reversed(uids))
+        # Reverse so newest (highest UID) is processed first, cap at 1000 unread
+        uids = list(reversed(uids))[:1000]
         total = len(uids)
 
         yield f"event: start\ndata: {json.dumps({'total': total})}\n\n"
