@@ -5,11 +5,11 @@ import os
 import queue
 import threading
 from email.header import decode_header
-from flask import Flask, Response, request, jsonify, stream_with_context
+from flask import Flask, Response, request, stream_with_context
 import anthropic
-
+ 
 app = Flask(__name__)
-
+ 
 IMAP_SERVERS = {
     "gmail":       "imap.gmail.com",
     "outlook":     "outlook.office365.com",
@@ -17,25 +17,27 @@ IMAP_SERVERS = {
     "centurylink": "mail.centurylink.net",
     "gulftel":     "mail.centurylink.net",
 }
-
+ 
 CLASSIFY_PROMPT = """You are an assistant that classifies finance newsletter emails.
-
+ 
 Return ONLY a valid JSON object, no extra text:
 {{
   "color": "green",
   "reason": "one sentence explanation"
 }}
-
+ 
 Color rules:
 - green:  ONLY valuable financial content (market data, earnings, economic analysis, news)
 - yellow: valuable financial content BUT ALSO subscription upsells or paid promotions mixed in
 - red:    primarily or entirely promotional — upgrades, webinar sales, subscription offers
-
+ 
 EMAIL SUBJECT: {subject}
 EMAIL BODY:
 {body}"""
-
-
+ 
+BATCH_SIZE = 10  # fetch and classify this many emails at a time
+ 
+ 
 def decode_str(value):
     parts = decode_header(value or "")
     result = []
@@ -45,8 +47,8 @@ def decode_str(value):
         else:
             result.append(str(part))
     return " ".join(result)
-
-
+ 
+ 
 def get_body(msg):
     body = ""
     if msg.is_multipart():
@@ -58,16 +60,15 @@ def get_body(msg):
     else:
         charset = msg.get_content_charset() or "utf-8"
         body = msg.get_payload(decode=True).decode(charset, errors="replace")
-    return body[:4000]
-
-
+    return body[:3000]
+ 
+ 
 def classify_one(client, uid, msg, result_queue):
-    """Classify a single email and push the result to the queue."""
     try:
         subject = decode_str(msg.get("Subject", "(no subject)"))
         sender  = decode_str(msg.get("From", "unknown"))
         body    = get_body(msg)
-
+ 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=150,
@@ -79,36 +80,37 @@ def classify_one(client, uid, msg, result_queue):
             if raw.startswith("json"):
                 raw = raw[4:]
         result = json.loads(raw.strip())
-
+ 
         result_queue.put({
-            "uid":     uid.decode(),
+            "uid":     uid.decode() if isinstance(uid, bytes) else str(uid),
             "subject": subject[:80],
             "sender":  sender[:60],
             "color":   result.get("color", "red"),
             "reason":  result.get("reason", ""),
-            "error":   False,
         })
     except Exception as e:
         result_queue.put({
             "uid":     uid.decode() if isinstance(uid, bytes) else str(uid),
-            "subject": "(error)",
+            "subject": "(error processing email)",
             "sender":  "",
             "color":   "red",
             "reason":  str(e),
-            "error":   True,
         })
-
-
+ 
+ 
 def apply_label(mail, uid, color):
-    """Copy email to its classifier folder."""
     folder = f"Finance-Classifier/{color.capitalize()}"
     try:
         mail.create(folder)
     except Exception:
         pass
-    mail.uid("COPY", uid if isinstance(uid, bytes) else uid.encode(), folder)
-
-
+    try:
+        uid_b = uid.encode() if isinstance(uid, str) else uid
+        mail.uid("COPY", uid_b, folder)
+    except Exception:
+        pass
+ 
+ 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -139,17 +141,15 @@ HTML = r"""<!DOCTYPE html>
   .field input::placeholder{color:var(--muted);}
   .hint{font-size:10px;color:var(--muted);line-height:1.5;}
   #imap-field{display:none;}
-  .run-btn{background:var(--accent);color:#080b10;border:none;border-radius:8px;font-family:var(--sans);font-weight:600;font-size:14px;padding:12px;cursor:pointer;width:100%;margin-top:auto;transition:opacity .15s,transform .1s;letter-spacing:.02em;}
-  .run-btn:hover{opacity:.85;}
-  .run-btn:active{transform:scale(.98);}
+  .run-btn{background:var(--accent);color:#080b10;border:none;border-radius:8px;font-family:var(--sans);font-weight:600;font-size:14px;padding:12px;cursor:pointer;width:100%;margin-top:auto;transition:opacity .15s,transform .1s;}
+  .run-btn:hover{opacity:.85;} .run-btn:active{transform:scale(.98);}
   .run-btn:disabled{opacity:.3;cursor:not-allowed;transform:none;}
   .status{font-size:11px;font-family:var(--mono);color:var(--muted);text-align:center;min-height:16px;}
-  .status.err{color:var(--red);}
-  .status.ok{color:var(--accent);}
-  .progress-wrap{padding:0 0 4px;display:none;}
-  .progress-track{height:2px;background:var(--border);border-radius:1px;overflow:hidden;}
-  .progress-fill{height:100%;background:var(--accent);border-radius:1px;width:0%;transition:width .3s ease;}
-  .progress-label{font-size:10px;font-family:var(--mono);color:var(--muted);margin-bottom:4px;}
+  .status.err{color:var(--red);} .status.ok{color:var(--accent);}
+  .prog-wrap{display:none;}
+  .prog-label{font-size:10px;font-family:var(--mono);color:var(--muted);margin-bottom:4px;}
+  .prog-track{height:2px;background:var(--border);border-radius:1px;overflow:hidden;}
+  .prog-fill{height:100%;background:var(--accent);width:0%;transition:width .3s ease;}
   .dashboard{display:flex;flex-direction:column;overflow:hidden;}
   .summary{display:grid;grid-template-columns:repeat(3,1fr);border-bottom:1px solid var(--border);}
   .card{padding:20px 24px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:5px;}
@@ -221,65 +221,46 @@ HTML = r"""<!DOCTYPE html>
       <input type="password" id="api_key" placeholder="sk-ant-...">
       <span class="hint">Get a free key at console.anthropic.com</span>
     </div>
-    <div class="sec-note">
-      🔒 Your credentials are never stored. They are only used for this session and sent directly to your email provider and Anthropic.
-    </div>
-    <div class="progress-wrap" id="progress-wrap">
-      <div class="progress-label" id="progress-label">Classifying...</div>
-      <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+    <div class="sec-note">🔒 Credentials are never stored — only used for this session.</div>
+    <div class="prog-wrap" id="prog-wrap">
+      <div class="prog-label" id="prog-label">Starting...</div>
+      <div class="prog-track"><div class="prog-fill" id="prog-fill"></div></div>
     </div>
     <div class="status" id="status"></div>
     <button class="run-btn" id="run-btn" onclick="run()">Run Classifier</button>
   </aside>
   <div class="dashboard">
     <div class="summary">
-      <div class="card g">
-        <div class="num" id="cnt-green">—</div>
-        <div class="lbl">Financial Content</div>
-        <div class="bar" id="bar-green"></div>
-      </div>
-      <div class="card y">
-        <div class="num" id="cnt-yellow">—</div>
-        <div class="lbl">Mixed + Upsell</div>
-        <div class="bar" id="bar-yellow"></div>
-      </div>
-      <div class="card r">
-        <div class="num" id="cnt-red">—</div>
-        <div class="lbl">Promotional</div>
-        <div class="bar" id="bar-red"></div>
-      </div>
+      <div class="card g"><div class="num" id="cnt-green">—</div><div class="lbl">Financial Content</div><div class="bar" id="bar-green"></div></div>
+      <div class="card y"><div class="num" id="cnt-yellow">—</div><div class="lbl">Mixed + Upsell</div><div class="bar" id="bar-yellow"></div></div>
+      <div class="card r"><div class="num" id="cnt-red">—</div><div class="lbl">Promotional</div><div class="bar" id="bar-red"></div></div>
     </div>
     <div class="list" id="list">
-      <div class="empty">
-        <div class="icon">📥</div>
-        <div>Fill in your credentials and click Run</div>
-      </div>
+      <div class="empty"><div class="icon">📥</div><div>Fill in your credentials and click Run</div></div>
     </div>
   </div>
 </main>
 <script>
-  const counts = {green:0, yellow:0, red:0};
-  let total = 0;
-  let listStarted = false;
-
+  const counts = {green:0,yellow:0,red:0};
+  let total = 0, done = 0, listStarted = false, evtSource = null;
+ 
   function onProviderChange() {
-    const p = document.getElementById("provider").value;
-    document.getElementById("imap-field").style.display = p === "other" ? "flex" : "none";
+    document.getElementById("imap-field").style.display =
+      document.getElementById("provider").value === "other" ? "flex" : "none";
   }
-
+ 
   function setStatus(msg, type="") {
     const el = document.getElementById("status");
-    el.textContent = msg;
-    el.className = "status " + type;
+    el.textContent = msg; el.className = "status "+type;
   }
-
+ 
   function updateBars() {
     ["green","yellow","red"].forEach(c => {
       document.getElementById(`cnt-${c}`).textContent = counts[c];
       document.getElementById(`bar-${c}`).style.width = total ? (counts[c]/total*100)+"%" : "0%";
     });
   }
-
+ 
   function appendRow(r) {
     const list = document.getElementById("list");
     if (!listStarted) {
@@ -288,103 +269,92 @@ HTML = r"""<!DOCTYPE html>
     }
     const row = document.createElement("div");
     row.className = "row";
-    row.innerHTML = `
-      <div class="dot ${r.color}"></div>
-      <div class="sub">${esc(r.subject)}</div>
-      <div class="snd">${esc(r.sender)}</div>
-      <div class="rsn">${esc(r.reason)}</div>`;
+    row.innerHTML = `<div class="dot ${r.color}"></div><div class="sub">${esc(r.subject)}</div><div class="snd">${esc(r.sender)}</div><div class="rsn">${esc(r.reason)}</div>`;
     list.appendChild(row);
     list.scrollTop = list.scrollHeight;
   }
-
+ 
   async function run() {
-    const emailVal   = document.getElementById("email").value.trim();
-    const password   = document.getElementById("password").value.trim();
-    const provider   = document.getElementById("provider").value;
+    const emailVal    = document.getElementById("email").value.trim();
+    const password    = document.getElementById("password").value.trim();
+    const provider    = document.getElementById("provider").value;
     const custom_imap = document.getElementById("custom_imap").value.trim();
-    const api_key    = document.getElementById("api_key").value.trim();
-    const btn        = document.getElementById("run-btn");
-
-    if (!emailVal || !emailVal.includes("@")) { setStatus("Enter a valid email.", "err"); return; }
-    if (!password)  { setStatus("Enter your password.", "err"); return; }
+    const api_key     = document.getElementById("api_key").value.trim();
+    const btn         = document.getElementById("run-btn");
+ 
+    if (!emailVal.includes("@"))  { setStatus("Enter a valid email.", "err"); return; }
+    if (!password)                { setStatus("Enter your password.", "err"); return; }
     if (!api_key.startsWith("sk-ant-")) { setStatus("API key must start with sk-ant-", "err"); return; }
     if (provider === "other" && !custom_imap) { setStatus("Enter your IMAP server.", "err"); return; }
-
+ 
+    if (evtSource) evtSource.close();
     btn.disabled = true;
     counts.green = counts.yellow = counts.red = 0;
-    total = 0;
-    listStarted = false;
+    total = 0; done = 0; listStarted = false;
     setStatus("Connecting...");
-    document.getElementById("progress-wrap").style.display = "block";
-    document.getElementById("progress-fill").style.width = "0%";
-    document.getElementById("list").innerHTML = `<div class="empty"><div class="spinner" style="display:block"></div><div>Connecting to inbox...</div></div>`;
-    ["green","yellow","red"].forEach(c => {
-      document.getElementById(`cnt-${c}`).textContent = "—";
-      document.getElementById(`bar-${c}`).style.width = "0%";
-    });
-
-    // SSE stream
-    const params = new URLSearchParams({email: emailVal, password, provider, custom_imap, api_key});
-    const evtSource = new EventSource(`/stream?${params}`);
-
+    document.getElementById("prog-wrap").style.display = "block";
+    document.getElementById("prog-fill").style.width = "0%";
+    document.getElementById("prog-label").textContent = "Connecting to inbox...";
+    document.getElementById("list").innerHTML = `<div class="empty"><div class="spinner" style="display:block"></div><div>Connecting...</div></div>`;
+    ["green","yellow","red"].forEach(c => { document.getElementById(`cnt-${c}`).textContent = "—"; document.getElementById(`bar-${c}`).style.width="0%"; });
+ 
+    const p = new URLSearchParams({email:emailVal, password, provider, custom_imap, api_key});
+    evtSource = new EventSource(`/stream?${p}`);
+ 
     evtSource.addEventListener("start", e => {
       const d = JSON.parse(e.data);
       total = d.total;
-      setStatus(`Classifying ${total} email(s)...`);
       if (total === 0) {
-        document.getElementById("list").innerHTML = `<div class="empty"><div class="icon">📭</div><div>No unread emails found.</div></div>`;
+        setStatus("No unread emails found.", "ok");
+        document.getElementById("list").innerHTML = `<div class="empty"><div class="icon">📭</div><div>No unread emails.</div></div>`;
         ["green","yellow","red"].forEach(c => document.getElementById(`cnt-${c}`).textContent = "0");
-        evtSource.close();
-        btn.disabled = false;
-        document.getElementById("progress-wrap").style.display = "none";
+        document.getElementById("prog-wrap").style.display = "none";
+        evtSource.close(); btn.disabled = false;
+      } else {
+        setStatus(`Found ${total} unread emails. Classifying...`);
+        document.getElementById("prog-label").textContent = `Classifying 0 / ${total}...`;
       }
     });
-
+ 
     evtSource.addEventListener("result", e => {
       const r = JSON.parse(e.data);
-      counts[r.color] = (counts[r.color] || 0) + 1;
-      const done = counts.green + counts.yellow + counts.red;
-      document.getElementById("progress-fill").style.width = total ? (done/total*100)+"%" : "0%";
-      document.getElementById("progress-label").textContent = `Classifying ${done} / ${total}...`;
+      counts[r.color] = (counts[r.color]||0) + 1;
+      done++;
+      document.getElementById("prog-fill").style.width = total ? (done/total*100)+"%" : "0%";
+      document.getElementById("prog-label").textContent = `Classifying ${done} / ${total}...`;
       updateBars();
       appendRow(r);
     });
-
-    evtSource.addEventListener("done", e => {
-      evtSource.close();
-      btn.disabled = false;
-      document.getElementById("progress-wrap").style.display = "none";
-      setStatus(`Done — ${total} email(s) classified.`, "ok");
+ 
+    evtSource.addEventListener("done", () => {
+      evtSource.close(); btn.disabled = false;
+      document.getElementById("prog-wrap").style.display = "none";
+      setStatus(`Done — ${done} email(s) classified.`, "ok");
     });
-
+ 
     evtSource.addEventListener("error_msg", e => {
       const d = JSON.parse(e.data);
-      evtSource.close();
-      btn.disabled = false;
-      document.getElementById("progress-wrap").style.display = "none";
+      evtSource.close(); btn.disabled = false;
+      document.getElementById("prog-wrap").style.display = "none";
       setStatus(d.message, "err");
       document.getElementById("list").innerHTML = `<div class="empty"><div class="icon">⚠️</div><div>${esc(d.message)}</div></div>`;
     });
-
-    evtSource.onerror = () => {
-      evtSource.close();
-      btn.disabled = false;
-      document.getElementById("progress-wrap").style.display = "none";
-      setStatus("Connection lost. Please try again.", "err");
-    };
+ 
+    // Keep stream alive — only close on explicit done/error events
+    evtSource.onerror = () => {};
   }
-
+ 
   function esc(s){ return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 </script>
 </body>
 </html>"""
-
-
+ 
+ 
 @app.route("/")
 def index():
     return Response(HTML, mimetype="text/html")
-
-
+ 
+ 
 @app.route("/stream")
 def stream():
     email_addr  = request.args.get("email", "").strip()
@@ -392,11 +362,10 @@ def stream():
     provider    = request.args.get("provider", "").strip().lower()
     custom_imap = request.args.get("custom_imap", "").strip()
     api_key     = request.args.get("api_key", "").strip()
-
-    server = custom_imap if provider == "other" else IMAP_SERVERS.get(provider)
-
+    server      = custom_imap if provider == "other" else IMAP_SERVERS.get(provider)
+ 
     def generate():
-        # Connect to IMAP
+        # Connect
         try:
             mail = imaplib.IMAP4_SSL(server, 993)
             mail.login(email_addr, password)
@@ -407,69 +376,69 @@ def stream():
         except Exception as e:
             yield f"event: error_msg\ndata: {json.dumps({'message': str(e)})}\n\n"
             return
-
-        # Fetch all unread UIDs
+ 
+        # Get all unread UIDs — just the IDs, very fast even with 14k emails
         status, data_raw = mail.uid("SEARCH", None, "UNSEEN")
         uids = data_raw[0].split() if status == "OK" and data_raw[0] else []
-        yield f"event: start\ndata: {json.dumps({'total': len(uids)})}\n\n"
-
+        total = len(uids)
+ 
+        yield f"event: start\ndata: {json.dumps({'total': total})}\n\n"
+ 
         if not uids:
             mail.logout()
             yield f"event: done\ndata: {{}}\n\n"
             return
-
-        # Fetch all email messages first
-        messages = {}
-        for uid in uids:
-            try:
-                s, msg_data = mail.uid("FETCH", uid, "(RFC822)")
-                if s == "OK":
-                    messages[uid] = email.message_from_bytes(msg_data[0][1])
-            except Exception:
-                pass
-
-        # Classify all in parallel using threads
-        result_queue = queue.Queue()
+ 
         client = anthropic.Anthropic(api_key=api_key)
-
-        threads = []
-        for uid, msg in messages.items():
-            t = threading.Thread(target=classify_one, args=(client, uid, msg, result_queue))
-            t.daemon = True
-            t.start()
-            threads.append(t)
-
-        # Stream results as they come in
-        received = 0
-        while received < len(messages):
-            try:
-                result = result_queue.get(timeout=30)
-                received += 1
-
-                # Apply label back to inbox
+ 
+        # Process in batches — fetch BATCH_SIZE emails, classify in parallel, stream results, repeat
+        for i in range(0, total, BATCH_SIZE):
+            batch_uids = uids[i:i + BATCH_SIZE]
+ 
+            # Fetch this batch of messages
+            messages = {}
+            for uid in batch_uids:
                 try:
-                    uid_bytes = result["uid"].encode()
-                    apply_label(mail, uid_bytes, result["color"])
+                    s, msg_data = mail.uid("FETCH", uid, "(RFC822)")
+                    if s == "OK":
+                        messages[uid] = email.message_from_bytes(msg_data[0][1])
                 except Exception:
                     pass
-
-                yield f"event: result\ndata: {json.dumps(result)}\n\n"
-            except queue.Empty:
-                break
-
+ 
+            # Classify batch in parallel
+            result_queue = queue.Queue()
+            threads = []
+            for uid, msg in messages.items():
+                t = threading.Thread(target=classify_one, args=(client, uid, msg, result_queue))
+                t.daemon = True
+                t.start()
+                threads.append(t)
+ 
+            # Stream results as they arrive from this batch
+            received = 0
+            while received < len(messages):
+                try:
+                    result = result_queue.get(timeout=25)
+                    received += 1
+                    # Apply label
+                    try:
+                        apply_label(mail, result["uid"], result["color"])
+                    except Exception:
+                        pass
+                    yield f"event: result\ndata: {json.dumps(result)}\n\n"
+                except queue.Empty:
+                    break
+ 
         mail.logout()
         yield f"event: done\ndata: {{}}\n\n"
-
+ 
     return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
-
-
+ 
+ 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
